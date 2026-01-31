@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import time
 import subprocess
 import shutil
 import json
@@ -46,16 +47,16 @@ configurar_dlls_nvidia()
 
 # ================== IMPORT DO WHISPER (GPU) ==================
 
-from faster_whisper import WhisperModel  # usa CUDA se disponível[web:16][web:19]
+from faster_whisper import WhisperModel  # [web:16][web:19]
 
 # ================== CONFIG GERAL ==================
 
 load_dotenv()
 
-LMSTUDIO_BASE_URL = "http://localhost:1234/v1"  # ajuste se for outra porta[web:2]
-LMSTUDIO_MODEL = "qwen2.5-7b-instruct-1m"       # nome lógico do modelo no LM Studio[web:31]
+LMSTUDIO_BASE_URL = "http://localhost:1234/v1"      # ajuste se mudar a porta[web:2]
+LMSTUDIO_MODEL = "qwen2.5-7b-instruct-1m"           # nome do modelo no LM Studio[web:31]
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")  # base/small/medium/large-v2[web:19]
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")  # [web:19]
 
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
@@ -147,7 +148,6 @@ def parse_title_and_year_from_filename(filename_base):
     """
     Tenta extrair 'Título' e 'Ano' de um nome no formato:
     'Titulo do Filme (1979)'.
-    Se não encontrar ano, devolve apenas o título limpo.
     """
     m = re.match(r"^(.*)\((\d{4})\)$", filename_base.strip())
     if m:
@@ -155,7 +155,6 @@ def parse_title_and_year_from_filename(filename_base):
         year = m.group(2)
         return title, year
 
-    # Se não estiver no formato Título (Ano), só limpa pontos/_ e retorna sem ano
     cleaned = re.sub(r"[._]+", " ", filename_base)
     cleaned = cleaned.strip()
     return cleaned, None
@@ -163,18 +162,16 @@ def parse_title_and_year_from_filename(filename_base):
 
 def call_omdb_by_search(raw_title_guess):
     """
-    Usa OMDb com 's=' (search) e tenta escolher o melhor resultado,
-    de preferência usando o ano se existir no nome do arquivo.[web:60][web:63][web:71]
+    Usa OMDb com 's=' (search) e tenta escolher o melhor resultado.[web:60][web:63][web:71]
     """
     if not OMDB_API_KEY:
         return None
 
     title, year = parse_title_and_year_from_filename(raw_title_guess)
 
-    # 1) Busca lista de resultados
     params_search = {
         "s": title,
-        "type": "movie",   # foca só em filmes[web:60]
+        "type": "movie",
         "apikey": OMDB_API_KEY,
     }
     if year:
@@ -192,9 +189,8 @@ def call_omdb_by_search(raw_title_guess):
     if data.get("Response") != "True" or "Search" not in data:
         return None
 
-    candidates = data["Search"]  # lista de {Title, Year, imdbID, Type}[web:60][web:63]
+    candidates = data["Search"]
 
-    # 2) Escolhe melhor candidato
     best = None
     if year:
         for c in candidates:
@@ -211,7 +207,6 @@ def call_omdb_by_search(raw_title_guess):
     if not imdb_id:
         return None
 
-    # 3) Busca detalhes completos pelo imdbID
     params_detail = {
         "i": imdb_id,
         "apikey": OMDB_API_KEY,
@@ -239,7 +234,7 @@ def call_omdb_by_search(raw_title_guess):
 
 # ================== LM Studio (Qwen2.5) ==================
 
-def lmstudio_chat(system_prompt, user_prompt, temperature=0.15, max_tokens=4096):
+def lmstudio_chat(system_prompt, user_prompt, temperature=0.15, max_tokens=2048):
     """
     Chamada à API de chat do LM Studio (compatível com OpenAI).[web:2][web:4]
     """
@@ -260,17 +255,15 @@ def lmstudio_chat(system_prompt, user_prompt, temperature=0.15, max_tokens=4096)
 
 # ================== Whisper local (GPU) ==================
 
-# Carregamos o modelo uma vez para reaproveitar
 WHISPER_MODEL = WhisperModel(
     WHISPER_MODEL_SIZE,
     device="cuda",
-    compute_type="int8_float16",  # bom compromisso entre qualidade e VRAM[web:19]
+    compute_type="int8_float16",  # [web:19]
 )
 
 def transcribe_with_whisper_to_srt(audio_path, srt_out_path, language=None):
     """
     Usa faster-whisper para transcrever audio_path e gerar um SRT básico.[web:16][web:19]
-    language: código ISO (ex: 'en', 'de', 'ru'); se None, auto-detecção.
     """
     segments, info = WHISPER_MODEL.transcribe(
         audio_path,
@@ -302,66 +295,118 @@ def transcribe_with_whisper_to_srt(audio_path, srt_out_path, language=None):
         lines.append(str(idx))
         lines.append(f"{start} --> {end}")
         lines.append(text)
-        lines.append("")  # linha em branco
+        lines.append("")
         idx += 1
 
     with open(srt_out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-# ================== Utilitários SRT (blocos) ==================
+# ================== Utilitários SRT (entradas) ==================
 
-def load_srt_entries(srt_path):
+def parse_srt_entries(srt_path):
     """
-    Lê um SRT e retorna uma lista de entradas, cada uma como string completa.
+    Lê um SRT e retorna lista de dicts:
+    {"index": "1", "time": "...", "text_lines": ["..."]}.
     """
     entries = []
-    current = []
-
     with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
+        block_lines = []
         for line in f:
             if line.strip() == "":
-                if current:
-                    entries.append("".join(current).rstrip() + "\n\n")
-                    current = []
+                if block_lines:
+                    entry = _parse_single_srt_block(block_lines)
+                    if entry:
+                        entries.append(entry)
+                    block_lines = []
             else:
-                current.append(line)
-        if current:
-            entries.append("".join(current).rstrip() + "\n\n")
-
+                block_lines.append(line.rstrip("\n"))
+        if block_lines:
+            entry = _parse_single_srt_block(block_lines)
+            if entry:
+                entries.append(entry)
     return entries
 
 
-def chunk_srt_entries_by_chars(entries, max_chars=16000):
+def _parse_single_srt_block(lines):
+    if len(lines) < 2:
+        return None
+    index = lines[0].strip()
+    time_line = lines[1].strip()
+    text_lines = [l for l in lines[2:] if l.strip() != ""]
+    return {"index": index, "time": time_line, "text_lines": text_lines}
+
+
+def serialize_srt_entries(entries):
+    out_lines = []
+    for e in entries:
+        out_lines.append(str(e["index"]))
+        out_lines.append(e["time"])
+        if e["text_lines"]:
+            out_lines.extend(e["text_lines"])
+        out_lines.append("")
+    return "\n".join(out_lines).strip() + "\n"
+
+
+def _split_text_into_lines(text, max_len=42):
     """
-    Agrupa entradas SRT em blocos cujo texto total não passa de max_chars.
-    max_chars ≈ 4000 tokens (usando ~4 caracteres por token).[web:48][web:56]
+    Quebra o texto em linhas de no máximo max_len caracteres.
     """
-    blocks = []
-    current_block = []
+    words = text.split()
+    lines = []
+    current = []
     current_len = 0
-
-    for entry in entries:
-        L = len(entry)
-        if current_len + L > max_chars and current_block:
-            blocks.append("".join(current_block))
-            current_block = [entry]
-            current_len = L
+    for w in words:
+        if current and current_len + 1 + len(w) > max_len:
+            lines.append(" ".join(current))
+            current = [w]
+            current_len = len(w)
         else:
-            current_block.append(entry)
-            current_len += L
+            if current:
+                current_len += 1 + len(w)
+            else:
+                current_len = len(w)
+            current.append(w)
+    if current:
+        lines.append(" ".join(current))
+    return lines
 
-    if current_block:
-        blocks.append("".join(current_block))
+# ================== Tradução/Revisão entrada a entrada ==================
 
-    return blocks
+def _parse_lote_resposta(resposta):
+    """
+    Lê resposta no formato:
+    ID: 12
+    TEXTO_TRADUZIDO: ...
+    """
+    traduzidos = {}
+    current_id = None
+    current_text_lines = []
+
+    for line in resposta.splitlines():
+        line = line.strip()
+        if line.startswith("ID:"):
+            if current_id is not None and current_text_lines:
+                traduzidos[current_id] = " ".join(current_text_lines).strip()
+            current_id = line[3:].strip()
+            current_text_lines = []
+        elif line.startswith("TEXTO_TRADUZIDO:"):
+            txt = line[len("TEXTO_TRADUZIDO:"):].strip()
+            current_text_lines.append(txt)
+        elif current_id is not None and line:
+            current_text_lines.append(line)
+
+    if current_id is not None and current_text_lines:
+        traduzidos[current_id] = " ".join(current_text_lines).strip()
+
+    return traduzidos
+
 
 def translate_and_review_srt(original_srt_path, movie_info=None):
     """
-    Divide o SRT em blocos (~4000 tokens), envia cada bloco para o Qwen
-    e concatena as saídas em um único SRT traduzido.
+    Percorre as entradas do SRT e, em blocos, pede ao Qwen para
+    traduzir/revisar apenas o texto, mantendo índices e tempos.
     """
-    entries = load_srt_entries(original_srt_path)
-    blocks = chunk_srt_entries_by_chars(entries, max_chars=16000)
+    entries = parse_srt_entries(original_srt_path)
 
     movie_context = ""
     if movie_info:
@@ -374,61 +419,65 @@ def translate_and_review_srt(original_srt_path, movie_info=None):
         )
 
     system_prompt = (
-        "Você é um tradutor profissional especializado em legendas de filmes.\n"
-        "Regras importantes:\n"
-        "- Mantenha todos os nomes próprios de pessoas e lugares no idioma original.\n"
-        "- Traduza para português do Brasil com foco em clareza, gramática e sintaxe corretas.\n"
-        "- Evite gírias atuais, internetês e expressões muito modernas; use um português neutro.\n"
-        "- Preserve a numeração e os timestamps das legendas no formato SRT.\n"
-        "- Cada bloco deve continuar sincronizado com o respectivo tempo; apenas traduza o texto.\n"
-        "- Não inclua comentários ou explicações extras; devolva APENAS o conteúdo SRT traduzido."
+        "Você é um tradutor e revisor profissional de legendas de filmes.\n"
+        "Regras:\n"
+        "- Receberá lotes de falas numeradas (ID) com texto original.\n"
+        "- Para cada fala, traduza o texto para português do Brasil, corrigindo gramática e sintaxe.\n"
+        "- Mantenha o sentido e o tom; evite gírias modernas e internetês.\n"
+        "- NÃO traduza nomes próprios de pessoas e lugares; mantenha no idioma original.\n"
+        "- NÃO adicione nem remova falas; devolva exatamente um texto traduzido por ID.\n"
+        "- Não inclua comentários extras.\n"
     )
 
-    translated_blocks = []
+    BATCH_SIZE = 100  # entradas de legenda por chamada
 
-    for i, block in enumerate(blocks, start=1):
-        print(f"Traduzindo bloco {i}/{len(blocks)}...")
+    for start in range(0, len(entries), BATCH_SIZE):
+        batch = entries[start:start + BATCH_SIZE]
+        print(f"Revendo/Traduzindo entradas {start + 1} a {start + len(batch)}...")
+
+        linhas_lote = []
+        for e in batch:
+            original_text = " / ".join(e["text_lines"])
+            linhas_lote.append(f"ID: {e['index']}")
+            linhas_lote.append(f"TEXTO_ORIGINAL: {original_text}")
+        lote_str = "\n".join(linhas_lote)
 
         user_prompt = (
-            "A seguir estão as informações conhecidas sobre o filme, seguidas de um TRECHO do arquivo SRT original.\n\n"
-            "=== INFORMAÇÕES DO FILME ===\n"
-            f"{movie_context}\n"
-            "=== TRECHO DE LEGENDA ORIGINAL (SRT) ===\n"
-            f"{block}\n"
-            "Por favor, devolva apenas o arquivo SRT traduzido e revisado deste trecho, "
-            "no mesmo formato, sem comentários adicionais."
+            "Informações sobre o filme:\n"
+            f"{movie_context}\n\n"
+            "A seguir está um lote de falas de legenda, cada uma com um ID e um TEXTO_ORIGINAL.\n"
+            "Para cada fala, devolva APENAS o texto traduzido e revisado, linha por linha, no formato:\n"
+            "ID: <id>\n"
+            "TEXTO_TRADUZIDO: <texto em português do Brasil>\n\n"
+            "Lote de falas:\n"
+            f"{lote_str}\n"
         )
 
-        translated_block = lmstudio_chat(
+        resposta = lmstudio_chat(
             system_prompt,
             user_prompt,
-            temperature=0.15,   # mais determinístico[web:31]
-            max_tokens=4096     # suficiente para blocos dessa ordem[web:32]
+            temperature=0.15,
+            max_tokens=2048
         )
 
-        translated_blocks.append(translated_block.rstrip() + "\n\n")
+        traduzidos = _parse_lote_resposta(resposta)
 
-    return "".join(translated_blocks)
+        for e in batch:
+            if e["index"] in traduzidos:
+                novo_texto = traduzidos[e["index"]]
+                e["text_lines"] = _split_text_into_lines(novo_texto, max_len=42)
+
+    return serialize_srt_entries(entries)
 
 # ================== Pipeline principal ==================
 
 def process_video_file(video_path, movie_title_guess=None):
-    """
-    Processa um único arquivo de vídeo:
-    - Tenta extrair legenda embutida.
-    - Se não tiver legenda, extrai áudio e gera SRT com Whisper (GPU).
-    - Detecta idioma da legenda.
-    - Obtém informações do filme pela OMDb via busca ('s=') usando o nome do arquivo.
-    - Traduz e revisa a legenda em blocos com Qwen (LM Studio).
-    - Salva SRT final em output/ e move o vídeo para output/.
-    """
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     temp_srt = os.path.join(INPUT_DIR, base_name + ".temp.srt")
     final_srt = os.path.join(OUTPUT_DIR, base_name + ".srt")
 
     print(f"Processando: {video_path}")
 
-    # 1) Tenta extrair legenda embutida
     has_subs = run_ffmpeg_extract_subtitles(video_path, temp_srt)
     if not has_subs:
         print("Nenhuma legenda embutida encontrada. Extraindo áudio e gerando legenda com Whisper (GPU)...")
@@ -437,29 +486,23 @@ def process_video_file(video_path, movie_title_guess=None):
         transcribe_with_whisper_to_srt(audio_path, temp_srt, language=None)
         os.remove(audio_path)
 
-    # 2) Detecta idioma da legenda
     lang = detect_language_from_srt(temp_srt)
     print(f"Idioma detectado da legenda: {lang}")
 
-    # 3) Busca informações do filme pela OMDb usando o nome do arquivo (base_name)
     movie_info = call_omdb_by_search(base_name)
     if movie_info:
         print("Informações do filme encontradas:", movie_info)
     else:
         print(f"Não foi possível obter informações do filme pela OMDb a partir de '{base_name}'.")
 
-    # 4) Tradução e revisão em blocos
     translated_srt_text = translate_and_review_srt(temp_srt, movie_info=movie_info)
 
-    # 5) Grava SRT final em output/
     with open(final_srt, "w", encoding="utf-8") as f:
         f.write(translated_srt_text)
 
-    # 6) Move o vídeo original para output/
     new_video_path = os.path.join(OUTPUT_DIR, os.path.basename(video_path))
     shutil.move(video_path, new_video_path)
 
-    # 7) Remove temporários
     if os.path.exists(temp_srt):
         os.remove(temp_srt)
 
@@ -476,9 +519,11 @@ def main():
         print(f"Nenhum arquivo de vídeo encontrado em '{INPUT_DIR}'.")
         return
 
-    for vf in video_files:
+    for i, vf in enumerate(video_files, start=1):
+        print(f"\n===== Iniciando vídeo {i}/{len(video_files)}: {vf} =====\n")
         video_path = os.path.join(INPUT_DIR, vf)
         process_video_file(video_path)
+        time.sleep(2)  # pequena pausa opcional entre vídeos
 
 
 if __name__ == "__main__":
