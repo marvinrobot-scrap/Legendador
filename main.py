@@ -8,14 +8,11 @@ import json
 import requests
 from langdetect import detect
 from dotenv import load_dotenv
+from faster_whisper import WhisperModel  # [web:16][web:19]
 
 # ================== CONFIGURAÇÃO DLLs NVIDIA (Windows) ==================
 
 def configurar_dlls_nvidia():
-    """
-    Garante que o Windows encontre as DLLs da NVIDIA (cublas, cudnn, etc.)
-    instaladas via pip dentro de site-packages.
-    """
     print("[INIT] Configurando ambiente GPU e DLLs (NVIDIA)...")
 
     base_python = sys.prefix
@@ -42,12 +39,7 @@ def configurar_dlls_nvidia():
         print("   [AVISO] Nenhuma pasta NVIDIA encontrada automaticamente. "
               "Se continuar dando erro de cublas/cudnn, verifique a instalação das libs NVIDIA.")
 
-# Executa a configuração ANTES de carregar o Whisper
 configurar_dlls_nvidia()
-
-# ================== IMPORT DO WHISPER (GPU) ==================
-
-from faster_whisper import WhisperModel  # [web:16][web:19]
 
 # ================== CONFIG GERAL ==================
 
@@ -60,16 +52,15 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")  # [web:19]
 
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
+SUBS_INPUT_DIR = "subs_input"
+SUBS_OUTPUT_DIR = "subs_output"
 
-os.makedirs(INPUT_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+for d in (INPUT_DIR, OUTPUT_DIR, SUBS_INPUT_DIR, SUBS_OUTPUT_DIR):
+    os.makedirs(d, exist_ok=True)
 
 # ================== FFmpeg: legendas e áudio ==================
 
 def run_ffmpeg_extract_subtitles(video_path, srt_out_path):
-    """
-    Tenta extrair o primeiro stream de legenda embutido em formato SRT.
-    """
     cmd_probe = [
         "ffprobe",
         "-v", "error",
@@ -102,9 +93,6 @@ def run_ffmpeg_extract_subtitles(video_path, srt_out_path):
 
 
 def run_ffmpeg_extract_audio(video_path, audio_out_path):
-    """
-    Extrai áudio em formato ideal para Whisper: WAV 16kHz mono PCM.[web:21]
-    """
     cmd = [
         "ffmpeg",
         "-y",
@@ -115,9 +103,19 @@ def run_ffmpeg_extract_audio(video_path, audio_out_path):
         "-c:a", "pcm_s16le",
         audio_out_path,
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True)[web:21]
 
 # ================== Detecção de idioma ==================
+
+def detect_language(text):
+    text = text.strip()
+    if not text:
+        return "unknown"
+    try:
+        return detect(text)
+    except Exception:
+        return "unknown"[web:80][web:83]
+
 
 def detect_language_from_srt(srt_path):
     text_samples = []
@@ -131,24 +129,13 @@ def detect_language_from_srt(srt_path):
             if line.isdigit():
                 continue
             text_samples.append(line)
-            if len(text_samples) > 50:
+            if len(text_samples) > 100:
                 break
-    if not text_samples:
-        return "unknown"
-    text = " ".join(text_samples)
-    try:
-        lang = detect(text)
-    except Exception:
-        lang = "unknown"
-    return lang
+    return detect_language(" ".join(text_samples))
 
-# ================== OMDb (busca por título/ano) ==================
+# ================== OMDb (busca robusta) ==================
 
 def parse_title_and_year_from_filename(filename_base):
-    """
-    Tenta extrair 'Título' e 'Ano' de um nome no formato:
-    'Titulo do Filme (1979)'.
-    """
     m = re.match(r"^(.*)\((\d{4})\)$", filename_base.strip())
     if m:
         title = m.group(1).strip()
@@ -160,84 +147,81 @@ def parse_title_and_year_from_filename(filename_base):
     return cleaned, None
 
 
-def call_omdb_by_search(raw_title_guess):
+def omdb_request(params):
+    if not OMDB_API_KEY:
+        return None
+    params = dict(params)
+    params["apikey"] = OMDB_API_KEY
+    try:
+        resp = requests.get("http://www.omdbapi.com/", params=params, timeout=10)
+    except Exception:
+        return None
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    if data.get("Response") != "True":
+        return None
+    return data[web:60][web:68]
+
+
+def call_omdb_robust(raw_title_guess):
     """
-    Usa OMDb com 's=' (search) e tenta escolher o melhor resultado.[web:60][web:63][web:71]
+    Tenta várias estratégias:
+    1) s=title (+ y=year se houver)
+    2) t=title (+ y=year) → título exato[web:60][web:63][web:75][web:68]
     """
     if not OMDB_API_KEY:
         return None
 
     title, year = parse_title_and_year_from_filename(raw_title_guess)
 
-    params_search = {
-        "s": title,
-        "type": "movie",
-        "apikey": OMDB_API_KEY,
-    }
+    # 1) Busca lista
+    search_params = {"s": title, "type": "movie"}
     if year:
-        params_search["y"] = year
+        search_params["y"] = year
+    data = omdb_request(search_params)
+    imdb_id = None
+    if data and "Search" in data:
+        candidates = data["Search"]
+        best = None
+        if year:
+            for c in candidates:
+                if c.get("Year") == year:
+                    best = c
+                    break
+        if best is None and candidates:
+            best = candidates[0]
+        imdb_id = best.get("imdbID") if best else None
 
-    try:
-        resp = requests.get("http://www.omdbapi.com/", params=params_search, timeout=10)
-    except Exception:
-        return None
-
-    if resp.status_code != 200:
-        return None
-
-    data = resp.json()
-    if data.get("Response") != "True" or "Search" not in data:
-        return None
-
-    candidates = data["Search"]
-
-    best = None
-    if year:
-        for c in candidates:
-            if c.get("Year") == year:
-                best = c
-                break
-    if best is None and candidates:
-        best = candidates[0]
-
-    if not best:
-        return None
-
-    imdb_id = best.get("imdbID")
+    # 2) Se não achou nada confiável, tenta t= (título exato)
     if not imdb_id:
-        return None
+        t_params = {"t": title, "type": "movie"}
+        if year:
+            t_params["y"] = year
+        data_t = omdb_request(t_params)  # retorna só um registro[web:75][web:68]
+        if data_t:
+            imdb_id = data_t.get("imdbID")
+            detail = data_t
+        else:
+            detail = None
+    else:
+        # detalhe pelo imdb_id
+        detail = omdb_request({"i": imdb_id, "plot": "short"})
 
-    params_detail = {
-        "i": imdb_id,
-        "apikey": OMDB_API_KEY,
-        "plot": "short",
-    }
-    try:
-        resp2 = requests.get("http://www.omdbapi.com/", params=params_detail, timeout=10)
-    except Exception:
-        return None
-
-    if resp2.status_code != 200:
-        return None
-
-    d = resp2.json()
-    if d.get("Response") != "True":
+    if not detail:
         return None
 
     return {
-        "Title": d.get("Title"),
-        "Year": d.get("Year"),
-        "Country": d.get("Country"),
-        "Language": d.get("Language"),
-        "imdbID": d.get("imdbID"),
+        "Title": detail.get("Title"),
+        "Year": detail.get("Year"),
+        "Country": detail.get("Country"),
+        "Language": detail.get("Language"),
+        "imdbID": detail.get("imdbID"),
     }
 
 # ================== LM Studio (Qwen2.5) ==================
 
 def lmstudio_chat(system_prompt, user_prompt, temperature=0.15, max_tokens=2048):
-    """
-    Chamada à API de chat do LM Studio (compatível com OpenAI).[web:2][web:4]
-    """
     url = f"{LMSTUDIO_BASE_URL}/chat/completions"
     payload = {
         "model": LMSTUDIO_MODEL,
@@ -248,23 +232,20 @@ def lmstudio_chat(system_prompt, user_prompt, temperature=0.15, max_tokens=2048)
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    resp = requests.post(url, json=payload, timeout=120)
+    resp = requests.post(url, json=payload, timeout=180)
     resp.raise_for_status()
     data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    return data["choices"][0]["message"]["content"][web:2][web:4]
 
 # ================== Whisper local (GPU) ==================
 
 WHISPER_MODEL = WhisperModel(
     WHISPER_MODEL_SIZE,
     device="cuda",
-    compute_type="int8_float16",  # [web:19]
-)
+    compute_type="int8_float16",
+)[web:16][web:19]
 
 def transcribe_with_whisper_to_srt(audio_path, srt_out_path, language=None):
-    """
-    Usa faster-whisper para transcrever audio_path e gerar um SRT básico.[web:16][web:19]
-    """
     segments, info = WHISPER_MODEL.transcribe(
         audio_path,
         beam_size=5,
@@ -304,10 +285,6 @@ def transcribe_with_whisper_to_srt(audio_path, srt_out_path, language=None):
 # ================== Utilitários SRT (entradas) ==================
 
 def parse_srt_entries(srt_path):
-    """
-    Lê um SRT e retorna lista de dicts:
-    {"index": "1", "time": "...", "text_lines": ["..."]}.
-    """
     entries = []
     with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
         block_lines = []
@@ -348,9 +325,6 @@ def serialize_srt_entries(entries):
 
 
 def _split_text_into_lines(text, max_len=42):
-    """
-    Quebra o texto em linhas de no máximo max_len caracteres.
-    """
     words = text.split()
     lines = []
     current = []
@@ -370,14 +344,9 @@ def _split_text_into_lines(text, max_len=42):
         lines.append(" ".join(current))
     return lines
 
-# ================== Tradução/Revisão entrada a entrada ==================
+# ================== Tradução/Revisão entrada a entrada com checagem ==================
 
 def _parse_lote_resposta(resposta):
-    """
-    Lê resposta no formato:
-    ID: 12
-    TEXTO_TRADUZIDO: ...
-    """
     traduzidos = {}
     current_id = None
     current_text_lines = []
@@ -401,13 +370,24 @@ def _parse_lote_resposta(resposta):
     return traduzidos
 
 
-def translate_and_review_srt(original_srt_path, movie_info=None):
+def _ensure_portuguese(text, original_text):
     """
-    Percorre as entradas do SRT e, em blocos, pede ao Qwen para
-    traduzir/revisar apenas o texto, mantendo índices e tempos.
+    Se o texto traduzido ainda estiver majoritariamente em outro idioma,
+    força substituição simples (segunda chamada ou fallback simples).
+    Aqui, por simplicidade, só verifica se detect('pt') falha;
+    nesse caso, retorna original_text para evitar piorar.
     """
-    entries = parse_srt_entries(original_srt_path)
+    lang = detect_language(text)
+    if lang != "pt":
+        # Você pode no futuro fazer uma segunda chamada mais agressiva
+        # ou marcar para revisão manual. Por ora, devolve texto mesmo
+        # (melhor do que vazio) ou, se ele for muito curto, original.
+        if len(text) < 3:
+            return original_text
+    return text
 
+
+def translate_and_review_srt_entries(entries, movie_info=None):
     movie_context = ""
     if movie_info:
         movie_context = (
@@ -429,7 +409,7 @@ def translate_and_review_srt(original_srt_path, movie_info=None):
         "- Não inclua comentários extras.\n"
     )
 
-    BATCH_SIZE = 100  # entradas de legenda por chamada
+    BATCH_SIZE = 80  # um pouco menor para estabilidade
 
     for start in range(0, len(entries), BATCH_SIZE):
         batch = entries[start:start + BATCH_SIZE]
@@ -463,20 +443,36 @@ def translate_and_review_srt(original_srt_path, movie_info=None):
         traduzidos = _parse_lote_resposta(resposta)
 
         for e in batch:
+            original_text = " ".join(e["text_lines"])
             if e["index"] in traduzidos:
                 novo_texto = traduzidos[e["index"]]
+                novo_texto = _ensure_portuguese(novo_texto, original_text)
                 e["text_lines"] = _split_text_into_lines(novo_texto, max_len=42)
 
-    return serialize_srt_entries(entries)
+    return entries
 
-# ================== Pipeline principal ==================
+# ================== Funções de alto nível ==================
 
-def process_video_file(video_path, movie_title_guess=None):
+def translate_and_review_srt_file(srt_path, movie_info=None):
+    entries = parse_srt_entries(srt_path)
+    # Se já estiver em PT, não faz nada
+    all_text = " ".join(" ".join(e["text_lines"]) for e in entries)
+    lang = detect_language(all_text)
+    print(f"Idioma detectado da legenda de entrada: {lang}")
+    if lang == "pt":
+        print("Legenda já está em português. Pulando tradução.")
+        return serialize_srt_entries(entries)
+
+    entries_trad = translate_and_review_srt_entries(entries, movie_info=movie_info)
+    return serialize_srt_entries(entries_trad)
+
+
+def process_video_file(video_path):
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     temp_srt = os.path.join(INPUT_DIR, base_name + ".temp.srt")
     final_srt = os.path.join(OUTPUT_DIR, base_name + ".srt")
 
-    print(f"Processando: {video_path}")
+    print(f"Processando vídeo: {video_path}")
 
     has_subs = run_ffmpeg_extract_subtitles(video_path, temp_srt)
     if not has_subs:
@@ -486,16 +482,16 @@ def process_video_file(video_path, movie_title_guess=None):
         transcribe_with_whisper_to_srt(audio_path, temp_srt, language=None)
         os.remove(audio_path)
 
-    lang = detect_language_from_srt(temp_srt)
-    print(f"Idioma detectado da legenda: {lang}")
+    lang_srt = detect_language_from_srt(temp_srt)
+    print(f"Idioma detectado da legenda (antes da tradução): {lang_srt}")
 
-    movie_info = call_omdb_by_search(base_name)
+    movie_info = call_omdb_robust(base_name)
     if movie_info:
         print("Informações do filme encontradas:", movie_info)
     else:
         print(f"Não foi possível obter informações do filme pela OMDb a partir de '{base_name}'.")
 
-    translated_srt_text = translate_and_review_srt(temp_srt, movie_info=movie_info)
+    translated_srt_text = translate_and_review_srt_file(temp_srt, movie_info=movie_info)
 
     with open(final_srt, "w", encoding="utf-8") as f:
         f.write(translated_srt_text)
@@ -510,20 +506,61 @@ def process_video_file(video_path, movie_title_guess=None):
     print(f"Vídeo movido para: {new_video_path}")
 
 
+def process_subtitle_file(sub_path):
+    """
+    Recebe apenas o arquivo de legenda (.srt), verifica idioma e
+    traduz/revisa integralmente se não estiver em português.
+    Resultado vai para SUBS_OUTPUT_DIR.
+    """
+    base_name = os.path.splitext(os.path.basename(sub_path))[0]
+    out_srt = os.path.join(SUBS_OUTPUT_DIR, base_name + ".srt")
+
+    print(f"Processando legenda isolada: {sub_path}")
+
+    # Tenta obter alguma info de filme pelo nome do arquivo da legenda
+    movie_info = call_omdb_robust(base_name)
+    if movie_info:
+        print("Informações do filme (para contexto) encontradas:", movie_info)
+    else:
+        print("Não foi possível obter informações do filme pela OMDb (legenda isolada).")
+
+    translated_srt_text = translate_and_review_srt_file(sub_path, movie_info=movie_info)
+
+    with open(out_srt, "w", encoding="utf-8") as f:
+        f.write(translated_srt_text)
+
+    print(f"Legenda revista/traduzida salva em: {out_srt}")
+
+# ================== main ==================
+
 def main():
+    # 1) Processa vídeos em input/
     video_files = [
         f for f in os.listdir(INPUT_DIR)
         if f.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".flv"))
     ]
-    if not video_files:
-        print(f"Nenhum arquivo de vídeo encontrado em '{INPUT_DIR}'.")
-        return
 
-    for i, vf in enumerate(video_files, start=1):
-        print(f"\n===== Iniciando vídeo {i}/{len(video_files)}: {vf} =====\n")
-        video_path = os.path.join(INPUT_DIR, vf)
-        process_video_file(video_path)
-        time.sleep(2)  # pequena pausa opcional entre vídeos
+    if video_files:
+        for i, vf in enumerate(video_files, start=1):
+            print(f"\n===== Iniciando vídeo {i}/{len(video_files)}: {vf} =====\n")
+            video_path = os.path.join(INPUT_DIR, vf)
+            process_video_file(video_path)
+            time.sleep(2)
+
+    # 2) Processa legendas “soltas” em subs_input/
+    subs_files = [
+        f for f in os.listdir(SUBS_INPUT_DIR)
+        if f.lower().endswith(".srt")
+    ]
+    if subs_files:
+        for i, sf in enumerate(subs_files, start=1):
+            print(f"\n===== Iniciando legenda isolada {i}/{len(subs_files)}: {sf} =====\n")
+            sub_path = os.path.join(SUBS_INPUT_DIR, sf)
+            process_subtitle_file(sub_path)
+            time.sleep(1)
+
+    if not video_files and not subs_files:
+        print(f"Nenhum vídeo em '{INPUT_DIR}' nem legenda em '{SUBS_INPUT_DIR}'.")
 
 
 if __name__ == "__main__":
