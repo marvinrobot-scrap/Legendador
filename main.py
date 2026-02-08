@@ -8,7 +8,7 @@ import json
 import requests
 from langdetect import detect
 from dotenv import load_dotenv
-from faster_whisper import WhisperModel  # [web:16][web:19]
+from faster_whisper import WhisperModel
 
 # ================== CONFIGURAÇÃO DLLs NVIDIA (Windows) ==================
 
@@ -45,10 +45,10 @@ configurar_dlls_nvidia()
 
 load_dotenv()
 
-LMSTUDIO_BASE_URL = "http://localhost:1234/v1"      # ajuste se mudar a porta[web:2]
-LMSTUDIO_MODEL = "qwen2.5-7b-instruct-1m"           # nome do modelo no LM Studio[web:31]
+LMSTUDIO_BASE_URL = "http://localhost:1234/v1"      # ajuste se mudar a porta
+LMSTUDIO_MODEL = "qwen2.5-7b-instruct-1m"           # nome do modelo no LM Studio
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")  # [web:19]
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
 
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
@@ -103,7 +103,7 @@ def run_ffmpeg_extract_audio(video_path, audio_out_path):
         "-c:a", "pcm_s16le",
         audio_out_path,
     ]
-    subprocess.run(cmd, check=True)[web:21]
+    subprocess.run(cmd, check=True)
 
 # ================== Detecção de idioma ==================
 
@@ -114,7 +114,7 @@ def detect_language(text):
     try:
         return detect(text)
     except Exception:
-        return "unknown"[web:80][web:83]
+        return "unknown"
 
 
 def detect_language_from_srt(srt_path):
@@ -161,8 +161,7 @@ def omdb_request(params):
     data = resp.json()
     if data.get("Response") != "True":
         return None
-    return data[web:60][web:68]
-
+    return data
 
 def call_omdb_robust(raw_title_guess):
     """
@@ -198,7 +197,7 @@ def call_omdb_robust(raw_title_guess):
         t_params = {"t": title, "type": "movie"}
         if year:
             t_params["y"] = year
-        data_t = omdb_request(t_params)  # retorna só um registro[web:75][web:68]
+        data_t = omdb_request(t_params)  # retorna só um registro
         if data_t:
             imdb_id = data_t.get("imdbID")
             detail = data_t
@@ -235,7 +234,7 @@ def lmstudio_chat(system_prompt, user_prompt, temperature=0.15, max_tokens=2048)
     resp = requests.post(url, json=payload, timeout=180)
     resp.raise_for_status()
     data = resp.json()
-    return data["choices"][0]["message"]["content"][web:2][web:4]
+    return data["choices"][0]["message"]["content"]
 
 # ================== Whisper local (GPU) ==================
 
@@ -243,7 +242,7 @@ WHISPER_MODEL = WhisperModel(
     WHISPER_MODEL_SIZE,
     device="cuda",
     compute_type="int8_float16",
-)[web:16][web:19]
+)
 
 def transcribe_with_whisper_to_srt(audio_path, srt_out_path, language=None):
     segments, info = WHISPER_MODEL.transcribe(
